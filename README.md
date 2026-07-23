@@ -22,6 +22,15 @@ A lightweight Windows desktop GUI for managing WSLC images and containers.
 - 右键复制容器名称或容器 ID
 - 显示容器状态和完整 ID
 
+### 在线更新
+
+- 启动时在后台检查 GitHub Releases
+- 可在左侧菜单手动检查更新
+- 显示新版本号和 Release 更新说明
+- 自动下载 Windows x64 更新包
+- 安装前校验发布包 SHA256
+- 更新成功后自动替换程序并重启
+
 ## 系统要求
 
 - Windows 10 或 Windows 11
@@ -46,6 +55,8 @@ DevDock.exe
 ```
 
 程序使用的 Logo、中文字体加载逻辑和其他必要资源均已包含在可执行文件中。
+
+`v0.1.1` 是首个包含在线更新功能的版本，需要手动下载安装一次。从该版本开始，后续版本可在 DevDock 内完成更新。
 
 ## 数据来源
 

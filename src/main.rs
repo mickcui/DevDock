@@ -5,6 +5,8 @@ compile_error!("DevDock only supports Windows");
 
 use std::{
     collections::HashSet,
+    fs::File,
+    io::{Read, Write},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -13,7 +15,14 @@ use std::{
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText};
 use egui_extras::{Column, TableBuilder};
+use semver::Version;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use ureq::ResponseExt;
+
+const GITHUB_LATEST_RELEASE: &str = "https://api.github.com/repos/mickcui/DevDock/releases/latest";
+const GITHUB_LATEST_PAGE: &str = "https://github.com/mickcui/DevDock/releases/latest";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
@@ -105,8 +114,35 @@ struct WslcContainer {
     state_changed_at: u64,
 }
 
+#[derive(Clone)]
+struct UpdateInfo {
+    version: String,
+    notes: String,
+    archive_url: String,
+    checksum_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 enum Message {
     WslcInstalled(Result<String, String>),
+    UpdateChecked {
+        manual: bool,
+        result: Result<Option<UpdateInfo>, String>,
+    },
+    UpdateInstalled(Result<(), String>),
     Images(Result<Vec<ImageRow>, String>),
     Containers(Result<Vec<ContainerRow>, String>),
     ImagesDeleted(Result<String, String>),
@@ -120,6 +156,10 @@ struct DevDock {
     wslc_available: bool,
     wslc_installing: bool,
     wslc_install_error: Option<String>,
+    update_checking: bool,
+    update_installing: bool,
+    update_available: Option<UpdateInfo>,
+    update_error: Option<String>,
     images: Vec<ImageRow>,
     containers: Vec<ContainerRow>,
     selected_images: HashSet<String>,
@@ -147,6 +187,10 @@ impl DevDock {
             wslc_available,
             wslc_installing: false,
             wslc_install_error: None,
+            update_checking: false,
+            update_installing: false,
+            update_available: None,
+            update_error: None,
             images: Vec::new(),
             containers: Vec::new(),
             selected_images: HashSet::new(),
@@ -166,7 +210,39 @@ impl DevDock {
             app.refresh_images(cc.egui_ctx.clone());
             app.refresh_containers(cc.egui_ctx.clone());
         }
+        app.check_for_updates(false, cc.egui_ctx.clone());
         app
+    }
+
+    fn check_for_updates(&mut self, manual: bool, ctx: egui::Context) {
+        if self.update_checking || self.update_installing {
+            return;
+        }
+        self.update_checking = true;
+        self.update_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = check_for_update();
+            let _ = tx.send(Message::UpdateChecked { manual, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, ctx: egui::Context) {
+        if self.update_installing {
+            return;
+        }
+        let Some(update) = self.update_available.clone() else {
+            return;
+        };
+        self.update_installing = true;
+        self.update_error = None;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = install_update(&update);
+            let _ = tx.send(Message::UpdateInstalled(result));
+            ctx.request_repaint();
+        });
     }
 
     fn install_wslc(&mut self, ctx: egui::Context) {
@@ -288,6 +364,29 @@ impl DevDock {
                         Err(error) => self.wslc_install_error = Some(error),
                     }
                 }
+                Message::UpdateChecked { manual, result } => {
+                    self.update_checking = false;
+                    match result {
+                        Ok(Some(update)) => self.update_available = Some(update),
+                        Ok(None) if manual => {
+                            self.status = Some(("当前已是最新版本".to_owned(), false));
+                        }
+                        Ok(None) => {}
+                        Err(error) if manual => self.status = Some((error, true)),
+                        Err(_) => {}
+                    }
+                }
+                Message::UpdateInstalled(result) => {
+                    self.update_installing = false;
+                    match result {
+                        Ok(()) => {
+                            if let Err(error) = restart_application() {
+                                self.update_error = Some(error);
+                            }
+                        }
+                        Err(error) => self.update_error = Some(error),
+                    }
+                }
                 Message::Images(result) => {
                     self.images_loading = false;
                     match result {
@@ -403,6 +502,23 @@ impl DevDock {
                 {
                     self.page = Page::Containers;
                 }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
+                    ui.add_space(4.0);
+                    if ui
+                        .add_enabled(
+                            !self.update_checking && !self.update_installing,
+                            egui::Button::new(if self.update_checking {
+                                "检查中..."
+                            } else {
+                                "检查更新"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.check_for_updates(true, ui.ctx().clone());
+                    }
+                });
             });
     }
 
@@ -435,6 +551,72 @@ impl DevDock {
                 if ui.button(button_text).clicked() {
                     self.install_wslc(ctx.clone());
                 }
+            }
+        });
+    }
+
+    fn update_modal(&mut self, ctx: &egui::Context) {
+        if !self.wslc_available {
+            return;
+        }
+        let Some(update) = self.update_available.clone() else {
+            return;
+        };
+        egui::Modal::new("application_update".into()).show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.heading(if self.update_installing {
+                "正在更新 DevDock"
+            } else {
+                "发现新版本"
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(format!("当前版本：v{APP_VERSION}"));
+                ui.separator();
+                ui.strong(format!("最新版本：v{}", update.version));
+            });
+
+            if !update.notes.trim().is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("更新说明").strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("update_notes")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.label(&update.notes);
+                    });
+            }
+
+            ui.add_space(12.0);
+            if self.update_installing {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在下载、校验并安装更新，请勿关闭程序...");
+                });
+            } else {
+                if let Some(error) = &self.update_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    ui.add_space(8.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("稍后").clicked() {
+                        self.update_available = None;
+                        self.update_error = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.operation_running,
+                            egui::Button::new(if self.update_error.is_some() {
+                                "重试更新"
+                            } else {
+                                "立即更新"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.install_update(ctx.clone());
+                    }
+                });
             }
         });
     }
@@ -806,6 +988,7 @@ impl eframe::App for DevDock {
                 Page::Containers => self.container_page(ui),
             }
         });
+        self.update_modal(ui.ctx());
         self.wslc_install_modal(ui.ctx());
     }
 }
@@ -855,6 +1038,191 @@ fn container_context_menu(response: &egui::Response, container: &ContainerRow) {
             ui.close();
         }
     });
+}
+
+fn check_for_update() -> Result<Option<UpdateInfo>, String> {
+    match http_get_text(GITHUB_LATEST_RELEASE) {
+        Ok(response) => {
+            let release: GithubRelease = serde_json::from_str(&response)
+                .map_err(|error| format!("无法解析 GitHub Release：{error}"))?;
+            update_from_release(release)
+        }
+        Err(api_error) => check_for_update_from_redirect()
+            .map_err(|error| format!("{api_error}；备用更新检查失败：{error}")),
+    }
+}
+
+fn check_for_update_from_redirect() -> Result<Option<UpdateInfo>, String> {
+    let response = ureq::head(GITHUB_LATEST_PAGE)
+        .header("User-Agent", "DevDock-Updater")
+        .call()
+        .map_err(|error| format!("网络请求失败：{error}"))?;
+    let tag = response
+        .get_uri()
+        .path()
+        .rsplit('/')
+        .next()
+        .filter(|tag| !tag.is_empty() && *tag != "latest")
+        .ok_or_else(|| "GitHub 未返回最新版本标签".to_owned())?;
+    update_from_tag(tag)
+}
+
+fn update_from_tag(tag: &str) -> Result<Option<UpdateInfo>, String> {
+    let version_text = tag.trim_start_matches('v');
+    let latest = Version::parse(version_text)
+        .map_err(|error| format!("Release 版本号无效（{tag}）：{error}"))?;
+    let current = Version::parse(APP_VERSION)
+        .map_err(|error| format!("当前版本号无效（{APP_VERSION}）：{error}"))?;
+    if latest <= current {
+        return Ok(None);
+    }
+    let archive_name = format!("DevDock-{latest}-windows-x64.zip");
+    let download_base = format!("https://github.com/mickcui/DevDock/releases/download/{tag}");
+    Ok(Some(UpdateInfo {
+        version: latest.to_string(),
+        notes: format!("请查看发布说明：https://github.com/mickcui/DevDock/releases/tag/{tag}"),
+        archive_url: format!("{download_base}/{archive_name}"),
+        checksum_url: format!("{download_base}/{archive_name}.sha256"),
+    }))
+}
+
+fn update_from_release(release: GithubRelease) -> Result<Option<UpdateInfo>, String> {
+    let version_text = release.tag_name.trim_start_matches('v');
+    let latest = Version::parse(version_text)
+        .map_err(|error| format!("Release 版本号无效（{}）：{error}", release.tag_name))?;
+    let current = Version::parse(APP_VERSION)
+        .map_err(|error| format!("当前版本号无效（{APP_VERSION}）：{error}"))?;
+    if latest <= current {
+        return Ok(None);
+    }
+
+    let archive_name = format!("DevDock-{latest}-windows-x64.zip");
+    let checksum_name = format!("{archive_name}.sha256");
+    let archive_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == archive_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| format!("Release 中缺少更新包：{archive_name}"))?;
+    let checksum_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == checksum_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| format!("Release 中缺少校验文件：{checksum_name}"))?;
+
+    Ok(Some(UpdateInfo {
+        version: latest.to_string(),
+        notes: release
+            .body
+            .or(release.name)
+            .unwrap_or_else(|| "此版本未提供更新说明。".to_owned()),
+        archive_url,
+        checksum_url,
+    }))
+}
+
+fn install_update(update: &UpdateInfo) -> Result<(), String> {
+    let current_exe =
+        std::env::current_exe().map_err(|error| format!("无法确定当前程序路径：{error}"))?;
+    let install_dir = current_exe
+        .parent()
+        .ok_or_else(|| "无法确定程序所在目录".to_owned())?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".devdock-update-")
+        .tempdir_in(install_dir)
+        .map_err(|error| format!("无法在程序目录创建更新文件：{error}"))?;
+    let archive_path = temp_dir.path().join("update.zip");
+
+    let expected_checksum = parse_expected_checksum(&http_get_text(&update.checksum_url)?)?;
+    download_to_file(&update.archive_url, &archive_path)?;
+    verify_file_checksum(&archive_path, &expected_checksum)?;
+
+    let archive_file =
+        File::open(&archive_path).map_err(|error| format!("无法打开更新包：{error}"))?;
+    let mut archive =
+        zip::ZipArchive::new(archive_file).map_err(|error| format!("更新包格式无效：{error}"))?;
+    let mut executable = archive
+        .by_name("DevDock.exe")
+        .map_err(|error| format!("更新包中缺少 DevDock.exe：{error}"))?;
+    let new_exe = temp_dir.path().join("DevDock.exe");
+    let mut output =
+        File::create(&new_exe).map_err(|error| format!("无法创建新版程序：{error}"))?;
+    std::io::copy(&mut executable, &mut output)
+        .map_err(|error| format!("无法解压新版程序：{error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("无法写入新版程序：{error}"))?;
+    drop(output);
+    drop(executable);
+    drop(archive);
+
+    self_replace::self_replace(&new_exe).map_err(|error| format!("无法替换当前程序：{error}"))
+}
+
+fn http_get_text(url: &str) -> Result<String, String> {
+    let mut response = ureq::get(url)
+        .header("User-Agent", "DevDock-Updater")
+        .call()
+        .map_err(|error| format!("网络请求失败：{error}"))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("读取网络响应失败：{error}"))
+}
+
+fn download_to_file(url: &str, path: &std::path::Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .header("User-Agent", "DevDock-Updater")
+        .call()
+        .map_err(|error| format!("下载更新包失败：{error}"))?;
+    let mut reader = response.into_body().into_reader();
+    let mut file = File::create(path).map_err(|error| format!("无法保存更新包：{error}"))?;
+    std::io::copy(&mut reader, &mut file).map_err(|error| format!("下载更新包失败：{error}"))?;
+    file.flush()
+        .map_err(|error| format!("无法保存更新包：{error}"))
+}
+
+fn parse_expected_checksum(content: &str) -> Result<String, String> {
+    let checksum = content
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Release 中的 SHA256 校验值无效".to_owned());
+    }
+    Ok(checksum)
+}
+
+fn verify_file_checksum(path: &std::path::Path, expected: &str) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|error| format!("无法读取更新包：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法校验更新包：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("更新包 SHA256 校验失败，已取消安装".to_owned())
+    }
+}
+
+fn restart_application() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("更新完成，但无法确定程序路径：{error}"))?;
+    Command::new(executable)
+        .spawn()
+        .map_err(|error| format!("更新完成，但无法重新启动程序：{error}"))?;
+    std::process::exit(0);
 }
 
 fn wslc_json<T: for<'de> Deserialize<'de>>(args: &[&str]) -> Result<Vec<T>, String> {
@@ -1027,4 +1395,75 @@ fn install_chinese_font(ctx: &egui::Context) {
             .insert(0, "windows_chinese".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_release_assets() {
+        let release: GithubRelease = serde_json::from_str(
+            r#"{
+                "tag_name": "v999.0.0",
+                "name": "Release v999.0.0",
+                "body": "Update notes",
+                "assets": [
+                    {
+                        "name": "DevDock-999.0.0-windows-x64.zip",
+                        "browser_download_url": "https://example.com/update.zip"
+                    },
+                    {
+                        "name": "DevDock-999.0.0-windows-x64.zip.sha256",
+                        "browser_download_url": "https://example.com/update.zip.sha256"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let update = update_from_release(release).unwrap().unwrap();
+        assert_eq!(update.version, "999.0.0");
+        assert_eq!(update.notes, "Update notes");
+        assert_eq!(update.archive_url, "https://example.com/update.zip");
+        assert_eq!(update.checksum_url, "https://example.com/update.zip.sha256");
+    }
+
+    #[test]
+    fn builds_fallback_release_urls() {
+        let update = update_from_tag("v999.0.0").unwrap().unwrap();
+        assert_eq!(update.version, "999.0.0");
+        assert_eq!(
+            update.archive_url,
+            "https://github.com/mickcui/DevDock/releases/download/v999.0.0/DevDock-999.0.0-windows-x64.zip"
+        );
+        assert_eq!(
+            update.checksum_url,
+            "https://github.com/mickcui/DevDock/releases/download/v999.0.0/DevDock-999.0.0-windows-x64.zip.sha256"
+        );
+    }
+
+    #[test]
+    fn parses_sha256_file() {
+        let hash = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        assert_eq!(
+            parse_expected_checksum(&format!("{hash}  DevDock.zip")).unwrap(),
+            hash.to_ascii_lowercase()
+        );
+        assert!(parse_expected_checksum("invalid").is_err());
+    }
+
+    #[test]
+    fn verifies_download_checksum() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"abc").unwrap();
+        assert!(
+            verify_file_checksum(
+                file.path(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            )
+            .is_ok()
+        );
+        assert!(verify_file_checksum(file.path(), &"0".repeat(64)).is_err());
+    }
 }

@@ -18,11 +18,11 @@ fn main() {
 
         let mut rgba = pixmap.take();
         for pixel in rgba.chunks_exact_mut(4) {
-            let alpha = u16::from(pixel[3]);
-            if alpha > 0 {
-                for channel in &mut pixel[..3] {
-                    *channel = (u16::from(*channel) * 255 / alpha).min(255) as u8;
-                }
+            let Some(alpha) = std::num::NonZeroU16::new(u16::from(pixel[3])) else {
+                continue;
+            };
+            for channel in &mut pixel[..3] {
+                *channel = (u16::from(*channel) * 255 / alpha.get()).min(255) as u8;
             }
         }
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
