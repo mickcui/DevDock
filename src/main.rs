@@ -1,13 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod terminal;
+
 #[cfg(not(target_os = "windows"))]
 compile_error!("DevDock only supports Windows");
 
 use std::{
     collections::HashSet,
+    ffi::OsStr,
     fs::File,
-    io::{Read, Write},
-    process::Command,
+    io::{BufRead, BufReader, Read, Write},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -19,6 +22,8 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ureq::ResponseExt;
+
+use terminal::TerminalSession;
 
 const GITHUB_LATEST_RELEASE: &str = "https://api.github.com/repos/mickcui/DevDock/releases/latest";
 const GITHUB_LATEST_PAGE: &str = "https://github.com/mickcui/DevDock/releases/latest";
@@ -34,6 +39,7 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        centered: true,
         ..Default::default()
     };
 
@@ -70,6 +76,8 @@ fn app_icon() -> Result<egui::IconData, String> {
 enum Page {
     Images,
     Containers,
+    Shell,
+    Settings,
 }
 
 #[derive(Clone, Deserialize)]
@@ -102,6 +110,16 @@ struct ContainerRow {
     image: String,
     status: String,
     state: String,
+    ports: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WslcPort {
+    binding_address: String,
+    container_port: u16,
+    host_port: u16,
+    protocol: u8,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +130,126 @@ struct WslcContainer {
     image: String,
     state: u8,
     state_changed_at: u64,
+    #[serde(default)]
+    ports: Vec<WslcPort>,
+}
+
+#[derive(Clone, Default)]
+struct CreateContainerForm {
+    image: String,
+    command: String,
+    arguments: String,
+    cidfile: String,
+    cpus: String,
+    detach: bool,
+    dns: String,
+    dns_option: String,
+    dns_search: String,
+    domainname: String,
+    entrypoint: String,
+    env: String,
+    env_file: String,
+    gpus: String,
+    hostname: String,
+    interactive: bool,
+    label: String,
+    memory: String,
+    name: String,
+    network: String,
+    network_alias: String,
+    publish: String,
+    publish_all: bool,
+    remove: bool,
+    shm_size: String,
+    stop_signal: String,
+    tmpfs: String,
+    tty: bool,
+    ulimit: String,
+    user: String,
+    volume: String,
+    workdir: String,
+}
+
+impl CreateContainerForm {
+    fn to_args(&self) -> Result<Vec<String>, String> {
+        let image = self.image.trim();
+        if image.is_empty() {
+            return Err("请输入镜像名称".to_owned());
+        }
+        if !self.cpus.trim().is_empty()
+            && self
+                .cpus
+                .trim()
+                .parse::<f64>()
+                .map_or(true, |cpus| !cpus.is_finite() || cpus <= 0.0)
+        {
+            return Err("CPU 数必须是大于 0 的数字".to_owned());
+        }
+
+        let mut args = vec!["run".to_owned()];
+        push_option(&mut args, "--cidfile", &self.cidfile);
+        push_option(&mut args, "--cpus", &self.cpus);
+        push_flag(&mut args, "--detach", self.detach);
+        push_repeated_options(&mut args, "--dns", &self.dns);
+        push_repeated_options(&mut args, "--dns-option", &self.dns_option);
+        push_repeated_options(&mut args, "--dns-search", &self.dns_search);
+        push_option(&mut args, "--domainname", &self.domainname);
+        push_option(&mut args, "--entrypoint", &self.entrypoint);
+        push_repeated_options(&mut args, "--env", &self.env);
+        push_repeated_options(&mut args, "--env-file", &self.env_file);
+        push_option(&mut args, "--gpus", &self.gpus);
+        push_option(&mut args, "--hostname", &self.hostname);
+        push_flag(&mut args, "--interactive", self.interactive);
+        push_repeated_options(&mut args, "--label", &self.label);
+        push_option(&mut args, "--memory", &self.memory);
+        push_option(&mut args, "--name", &self.name);
+        push_option(&mut args, "--network", &self.network);
+        push_repeated_options(&mut args, "--network-alias", &self.network_alias);
+        push_repeated_options(&mut args, "--publish", &self.publish);
+        push_flag(&mut args, "--publish-all", self.publish_all);
+        push_flag(&mut args, "--rm", self.remove);
+        push_option(&mut args, "--shm-size", &self.shm_size);
+        push_option(&mut args, "--stop-signal", &self.stop_signal);
+        push_repeated_options(&mut args, "--tmpfs", &self.tmpfs);
+        push_flag(&mut args, "--tty", self.tty);
+        push_repeated_options(&mut args, "--ulimit", &self.ulimit);
+        push_option(&mut args, "--user", &self.user);
+        push_repeated_options(&mut args, "--volume", &self.volume);
+        push_option(&mut args, "--workdir", &self.workdir);
+        args.push(image.to_owned());
+        if !self.command.trim().is_empty() {
+            args.push(self.command.trim().to_owned());
+        }
+        args.extend(non_empty_lines(&self.arguments));
+        Ok(args)
+    }
+}
+
+fn push_option(args: &mut Vec<String>, option: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        args.extend([option.to_owned(), value.to_owned()]);
+    }
+}
+
+fn push_flag(args: &mut Vec<String>, option: &str, enabled: bool) {
+    if enabled {
+        args.push(option.to_owned());
+    }
+}
+
+fn push_repeated_options(args: &mut Vec<String>, option: &str, values: &str) {
+    for value in non_empty_lines(values) {
+        args.extend([option.to_owned(), value]);
+    }
+}
+
+fn non_empty_lines(values: &str) -> impl Iterator<Item = String> + '_ {
+    values
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 #[derive(Clone)]
@@ -146,14 +284,18 @@ enum Message {
     Images(Result<Vec<ImageRow>, String>),
     Containers(Result<Vec<ContainerRow>, String>),
     ImagesDeleted(Result<String, String>),
+    ImagePullOutput(String),
+    ImagePulled(Result<(), String>),
     ContainerStarted(Result<String, String>),
     ContainerStopped(Result<String, String>),
     ContainerDeleted(Result<String, String>),
+    ContainerCreated(Result<String, String>),
 }
 
 struct DevDock {
     page: Page,
     wslc_available: bool,
+    wslc_version: Option<String>,
     wslc_installing: bool,
     wslc_install_error: Option<String>,
     update_checking: bool,
@@ -166,6 +308,15 @@ struct DevDock {
     selected_container: Option<String>,
     image_name_query: String,
     image_id_query: String,
+    image_pull_name: String,
+    image_pull_log: String,
+    image_pull_open: bool,
+    image_pulling: bool,
+    image_delete_confirm_open: bool,
+    container_delete_confirm_open: bool,
+    container_create_open: bool,
+    container_create_form: CreateContainerForm,
+    terminal: Option<TerminalSession>,
     container_name_query: String,
     container_image_query: String,
     images_loading: bool,
@@ -181,10 +332,12 @@ impl DevDock {
         install_chinese_font(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
-        let wslc_available = is_wslc_available();
+        let wslc_version = get_wslc_version();
+        let wslc_available = wslc_version.is_some();
         let mut app = Self {
             page: Page::Images,
             wslc_available,
+            wslc_version,
             wslc_installing: false,
             wslc_install_error: None,
             update_checking: false,
@@ -197,6 +350,15 @@ impl DevDock {
             selected_container: None,
             image_name_query: String::new(),
             image_id_query: String::new(),
+            image_pull_name: String::new(),
+            image_pull_log: String::new(),
+            image_pull_open: false,
+            image_pulling: false,
+            image_delete_confirm_open: false,
+            container_delete_confirm_open: false,
+            container_create_open: false,
+            container_create_form: CreateContainerForm::default(),
+            terminal: None,
             container_name_query: String::new(),
             container_image_query: String::new(),
             images_loading: false,
@@ -297,7 +459,7 @@ impl DevDock {
             .images
             .iter()
             .filter(|image| self.selected_images.contains(&image.key()))
-            .map(ImageRow::delete_target)
+            .map(ImageRow::command_target)
             .collect();
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -306,6 +468,22 @@ impl DevDock {
                 .try_for_each(|target| run_wslc(&["image", "rm", target]).map(|_| ()))
                 .map(|_| String::new());
             let _ = tx.send(Message::ImagesDeleted(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn pull_image(&mut self, ctx: egui::Context) {
+        let image = self.image_pull_name.trim().to_owned();
+        if self.operation_running || image.is_empty() {
+            return;
+        }
+        self.operation_running = true;
+        self.image_pulling = true;
+        self.image_pull_log = format!("$ wslc pull {image}\n\n");
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = run_wslc_pull(&image, tx.clone(), ctx.clone());
+            let _ = tx.send(Message::ImagePulled(result));
             ctx.request_repaint();
         });
     }
@@ -349,6 +527,26 @@ impl DevDock {
         });
     }
 
+    fn create_container(&mut self, ctx: egui::Context) {
+        if self.operation_running {
+            return;
+        }
+        let args = match self.container_create_form.to_args() {
+            Ok(args) => args,
+            Err(error) => {
+                self.status = Some((error, true));
+                return;
+            }
+        };
+        self.operation_running = true;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = run_wslc_args(&args);
+            let _ = tx.send(Message::ContainerCreated(result));
+            ctx.request_repaint();
+        });
+    }
+
     fn receive_messages(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
@@ -357,6 +555,7 @@ impl DevDock {
                     match result {
                         Ok(_) => {
                             self.wslc_available = true;
+                            self.wslc_version = get_wslc_version();
                             self.status = Some(("WSLC 已安装".to_owned(), false));
                             self.refresh_images(ctx.clone());
                             self.refresh_containers(ctx.clone());
@@ -416,11 +615,30 @@ impl DevDock {
                     self.operation_running = false;
                     match result {
                         Ok(_) => {
+                            self.image_delete_confirm_open = false;
                             self.selected_images.clear();
                             self.status = Some(("所选镜像已删除".to_owned(), false));
                             self.refresh_images(ctx.clone());
                         }
                         Err(error) => self.status = Some((error, true)),
+                    }
+                }
+                Message::ImagePullOutput(output) => {
+                    self.image_pull_log.push_str(&output);
+                }
+                Message::ImagePulled(result) => {
+                    self.operation_running = false;
+                    self.image_pulling = false;
+                    match result {
+                        Ok(()) => {
+                            self.image_pull_log.push_str("\n镜像拉取完成。\n");
+                            self.status = Some(("镜像拉取完成".to_owned(), false));
+                            self.refresh_images(ctx.clone());
+                        }
+                        Err(error) => {
+                            self.image_pull_log.push_str(&format!("\n{error}\n"));
+                            self.status = Some((error, true));
+                        }
                     }
                 }
                 Message::ContainerStarted(result) => {
@@ -445,9 +663,21 @@ impl DevDock {
                 }
                 Message::ContainerDeleted(result) => {
                     self.operation_running = false;
+                    self.container_delete_confirm_open = false;
                     match result {
                         Ok(_) => {
                             self.status = Some(("容器已删除".to_owned(), false));
+                            self.refresh_containers(ctx.clone());
+                        }
+                        Err(error) => self.status = Some((error, true)),
+                    }
+                }
+                Message::ContainerCreated(result) => {
+                    self.operation_running = false;
+                    match result {
+                        Ok(_) => {
+                            self.container_create_open = false;
+                            self.status = Some(("容器已创建".to_owned(), false));
                             self.refresh_containers(ctx.clone());
                         }
                         Err(error) => self.status = Some((error, true)),
@@ -502,9 +732,50 @@ impl DevDock {
                 {
                     self.page = Page::Containers;
                 }
+                if let Some(terminal) = &self.terminal {
+                    ui.add_space(6.0);
+                    let title = format!("Shell · {}", terminal.container_name);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::selectable(
+                                self.page == Page::Shell,
+                                RichText::new(title).size(14.0),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.page = Page::Shell;
+                    }
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::selectable(
+                            self.page == Page::Settings,
+                            RichText::new("设置").size(15.0),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.page = Page::Settings;
+                }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
-                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("DevDock v{APP_VERSION}"))
+                            .size(13.0)
+                            .weak(),
+                    );
+                    ui.label(
+                        RichText::new(match &self.wslc_version {
+                            Some(version) => format!("WSLC v{version}"),
+                            None => "WSLC 未安装".to_owned(),
+                        })
+                        .size(13.0)
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
                     if ui
                         .add_enabled(
                             !self.update_checking && !self.update_installing,
@@ -636,33 +907,59 @@ impl DevDock {
             }
         });
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.image_name_query)
-                    .hint_text("镜像名称")
-                    .desired_width(190.0),
-            );
-            ui.add_space(10.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.image_id_query)
-                    .hint_text("镜像 ID")
-                    .desired_width(190.0),
-            );
-            ui.add_space(10.0);
-            let delete_text = format!("删除 ({})", self.selected_images.len());
-            if ui
-                .add_enabled(
-                    !self.selected_images.is_empty() && !self.operation_running,
-                    egui::Button::new(delete_text),
-                )
-                .clicked()
-            {
-                self.delete_selected_images(ui.ctx().clone());
-            }
-            if self.operation_running {
-                ui.spinner();
-            }
-        });
+        egui::Frame::group(ui.style())
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let search_width = ((ui.available_width() - 300.0) / 2.0).clamp(145.0, 190.0);
+                    ui.add_sized(
+                        [search_width, 34.0],
+                        egui::TextEdit::singleline(&mut self.image_name_query)
+                            .hint_text("镜像名称")
+                            .font(egui::FontId::proportional(14.0))
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_sized(
+                        [search_width, 34.0],
+                        egui::TextEdit::singleline(&mut self.image_id_query)
+                            .hint_text("镜像 ID")
+                            .font(egui::FontId::proportional(14.0))
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.separator();
+
+                    let delete_text = format!("删除 ({})", self.selected_images.len());
+                    let delete_color = ui.visuals().error_fg_color;
+                    if ui
+                        .add_enabled(
+                            !self.selected_images.is_empty() && !self.operation_running,
+                            egui::Button::new(RichText::new(delete_text).color(delete_color))
+                                .stroke(egui::Stroke::new(1.0, delete_color))
+                                .min_size(egui::vec2(90.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.image_delete_confirm_open = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.operation_running,
+                            egui::Button::new(RichText::new("拉取").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(50, 105, 190))
+                                .min_size(egui::vec2(76.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.image_pull_name.clear();
+                        self.image_pull_log.clear();
+                        self.image_pull_open = true;
+                    }
+                    if self.operation_running {
+                        ui.spinner();
+                    }
+                });
+            });
         ui.add_space(12.0);
 
         let name_query = self.image_name_query.trim().to_lowercase();
@@ -678,89 +975,692 @@ impl DevDock {
             .collect();
 
         style_table_rows(ui);
-        egui::ScrollArea::horizontal()
-            .id_salt("images_horizontal_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_min_width(1_250.0);
-                let table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::exact(34.0))
-                    .column(Column::initial(300.0).at_least(170.0))
-                    .column(Column::initial(140.0).at_least(70.0))
-                    .column(Column::initial(100.0).at_least(70.0))
-                    .column(Column::initial(180.0).at_least(130.0))
-                    .column(Column::remainder().at_least(450.0))
-                    .header(32.0, |mut header| {
-                        header.col(|_| {});
-                        header.col(|ui| {
-                            ui.strong("镜像名称");
-                        });
-                        header.col(|ui| {
-                            ui.strong("标签");
-                        });
-                        header.col(|ui| {
-                            ui.strong("大小");
-                        });
-                        header.col(|ui| {
-                            ui.strong("创建时间");
-                        });
-                        header.col(|ui| {
-                            ui.strong("镜像 ID");
-                        });
-                    });
-
-                table.body(|mut body| {
-                    for image in images {
-                        body.row(30.0, |mut row| {
-                            let key = image.key();
-                            row.set_selected(self.selected_images.contains(&key));
-                            let mut checkbox_changed = false;
-                            row.col(|ui| {
-                                let mut selected = self.selected_images.contains(&key);
-                                if ui.checkbox(&mut selected, "").changed() {
-                                    checkbox_changed = true;
-                                    if selected {
-                                        self.selected_images.insert(key.clone());
-                                    } else {
-                                        self.selected_images.remove(&key);
-                                    }
-                                }
-                            });
-                            row.col(|ui| {
-                                ui.label(&image.repository);
-                            });
-                            row.col(|ui| {
-                                ui.label(&image.tag);
-                            });
-                            row.col(|ui| {
-                                ui.label(&image.size);
-                            });
-                            row.col(|ui| {
-                                ui.label(&image.created_at);
-                            });
-                            row.col(|ui| {
-                                ui.label(&image.id);
-                            });
-                            let response = row.response();
-                            if response.clicked() && !checkbox_changed {
-                                if self.selected_images.contains(&key) {
-                                    self.selected_images.remove(&key);
-                                } else {
-                                    self.selected_images.insert(key.clone());
-                                }
-                            }
-                            if response.secondary_clicked() {
-                                self.selected_images.insert(key);
-                            }
-                            image_context_menu(&response, &image);
-                        });
+        if images.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(120.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    let message = if self.images_loading {
+                        "正在加载镜像..."
+                    } else if self.images.is_empty() {
+                        "暂无本地镜像"
+                    } else {
+                        "没有符合筛选条件的镜像"
+                    };
+                    ui.label(RichText::new(message).size(15.0).weak());
+                    if !self.images_loading && self.images.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("点击右上角“拉取”添加镜像").small().weak());
                     }
                 });
             });
+            return;
+        }
+
+        let visible_image_keys: HashSet<_> = images.iter().map(ImageRow::key).collect();
+        egui::Frame::group(ui.style())
+            .inner_margin(0.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("images_horizontal_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(960.0);
+                        let header_color = ui.visuals().weak_text_color();
+                        let table = TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(true)
+                            .sense(egui::Sense::click())
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::exact(36.0))
+                            .column(Column::initial(280.0).at_least(180.0))
+                            .column(Column::initial(110.0).at_least(80.0))
+                            .column(Column::initial(100.0).at_least(80.0))
+                            .column(Column::initial(150.0).at_least(120.0))
+                            .column(Column::remainder().at_least(300.0))
+                            .header(38.0, |mut header| {
+                                header.col(|ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        let mut all_selected = visible_image_keys
+                                            .iter()
+                                            .all(|key| self.selected_images.contains(key));
+                                        if ui
+                                            .checkbox(&mut all_selected, "")
+                                            .on_hover_text("全选当前筛选结果")
+                                            .changed()
+                                        {
+                                            if all_selected {
+                                                self.selected_images
+                                                    .extend(visible_image_keys.iter().cloned());
+                                            } else {
+                                                self.selected_images.retain(|key| {
+                                                    !visible_image_keys.contains(key)
+                                                });
+                                            }
+                                        }
+                                    });
+                                });
+                                for title in ["镜像名称", "标签", "大小", "创建时间", "镜像 ID"]
+                                {
+                                    header.col(|ui| {
+                                        ui.label(RichText::new(title).strong().color(header_color));
+                                    });
+                                }
+                            });
+
+                        table.body(|mut body| {
+                            for image in images {
+                                body.row(40.0, |mut row| {
+                                    let key = image.key();
+                                    row.set_selected(self.selected_images.contains(&key));
+                                    let mut checkbox_changed = false;
+                                    row.col(|ui| {
+                                        ui.centered_and_justified(|ui| {
+                                            let mut selected = self.selected_images.contains(&key);
+                                            if ui.checkbox(&mut selected, "").changed() {
+                                                checkbox_changed = true;
+                                                if selected {
+                                                    self.selected_images.insert(key.clone());
+                                                } else {
+                                                    self.selected_images.remove(&key);
+                                                }
+                                            }
+                                        });
+                                    });
+                                    row.col(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&image.repository).strong(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&image.repository);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&image.tag);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(RichText::new(&image.size).weak());
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(RichText::new(&image.created_at).weak());
+                                    });
+                                    row.col(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&image.id).monospace().weak(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&image.id);
+                                    });
+                                    let response = row.response();
+                                    if response.clicked() && !checkbox_changed {
+                                        if self.selected_images.contains(&key) {
+                                            self.selected_images.remove(&key);
+                                        } else {
+                                            self.selected_images.insert(key.clone());
+                                        }
+                                    }
+                                    if response.secondary_clicked() {
+                                        self.selected_images.insert(key);
+                                    }
+                                    image_context_menu(&response, &image);
+                                });
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn image_pull_modal(&mut self, ctx: &egui::Context) {
+        if !self.image_pull_open {
+            return;
+        }
+        egui::Modal::new("image_pull".into()).show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.heading(RichText::new("拉取镜像").size(20.0));
+            ui.add_space(4.0);
+            ui.label(RichText::new("从镜像仓库下载镜像到本地。").weak());
+            ui.add_space(16.0);
+
+            ui.label(RichText::new("镜像名").strong());
+            ui.add_space(4.0);
+            let input = ui
+                .add_enabled_ui(!self.image_pulling, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 38.0],
+                        egui::TextEdit::singleline(&mut self.image_pull_name)
+                            .hint_text("例如：ubuntu:latest")
+                            .font(egui::FontId::proportional(16.0))
+                            .vertical_align(egui::Align::Center),
+                    )
+                })
+                .inner;
+            let submit_with_enter =
+                input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("输出日志").strong());
+                if self.image_pulling {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("正在拉取")
+                            .small()
+                            .color(Color32::from_rgb(70, 135, 220)),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            let dark_mode = ui.visuals().dark_mode;
+            let terminal_fill = if dark_mode {
+                Color32::from_rgb(20, 23, 28)
+            } else {
+                Color32::from_rgb(246, 248, 251)
+            };
+            let terminal_text = if dark_mode {
+                Color32::from_rgb(215, 222, 232)
+            } else {
+                Color32::from_rgb(45, 52, 62)
+            };
+            egui::Frame::group(ui.style())
+                .fill(terminal_fill)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("image_pull_log")
+                        .stick_to_bottom(true)
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.set_min_height(240.0);
+                            ui.set_min_width(ui.available_width());
+                            let log = if self.image_pull_log.is_empty() {
+                                "等待开始拉取..."
+                            } else {
+                                &self.image_pull_log
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(log).monospace().color(terminal_text),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                        });
+                });
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_pull =
+                        !self.operation_running && !self.image_pull_name.trim().is_empty();
+                    let pull_text = if self.image_pulling {
+                        "拉取中..."
+                    } else {
+                        "开始拉取"
+                    };
+                    if ui
+                        .add_enabled(
+                            can_pull,
+                            egui::Button::new(RichText::new(pull_text).color(Color32::WHITE))
+                                .fill(Color32::from_rgb(50, 105, 190))
+                                .min_size(egui::vec2(96.0, 32.0)),
+                        )
+                        .clicked()
+                        || (submit_with_enter && can_pull)
+                    {
+                        self.pull_image(ctx.clone());
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            !self.image_pulling,
+                            egui::Button::new("关闭").min_size(egui::vec2(72.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.image_pull_open = false;
+                    }
+                });
+            });
+        });
+    }
+
+    fn image_delete_confirm_modal(&mut self, ctx: &egui::Context) {
+        if !self.image_delete_confirm_open {
+            return;
+        }
+        if self.selected_images.is_empty() {
+            self.image_delete_confirm_open = false;
+            return;
+        }
+
+        egui::Modal::new("image_delete_confirm".into()).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(RichText::new("确认删除镜像").size(20.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new("所选镜像将从本地存储中移除。").weak());
+            ui.add_space(14.0);
+
+            let warning_fill = if ui.visuals().dark_mode {
+                Color32::from_rgb(55, 32, 34)
+            } else {
+                Color32::from_rgb(255, 241, 241)
+            };
+            egui::Frame::group(ui.style())
+                .fill(warning_fill)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("!")
+                                .size(22.0)
+                                .strong()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "即将删除 {} 个镜像",
+                                    self.selected_images.len()
+                                ))
+                                .strong(),
+                            );
+                            ui.label(RichText::new("删除后无法撤销。请确保镜像不再需要。").weak());
+                        });
+                    });
+                });
+
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.operation_running,
+                        egui::Button::new(RichText::new("确认删除").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(190, 55, 55))
+                            .min_size(egui::vec2(92.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.image_delete_confirm_open = false;
+                    self.delete_selected_images(ctx.clone());
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add(egui::Button::new("取消").min_size(egui::vec2(72.0, 32.0)))
+                    .clicked()
+                {
+                    self.image_delete_confirm_open = false;
+                }
+            });
+        });
+    }
+
+    fn container_delete_confirm_modal(&mut self, ctx: &egui::Context) {
+        if !self.container_delete_confirm_open {
+            return;
+        }
+        let Some(container) = self
+            .selected_container
+            .as_ref()
+            .and_then(|id| self.containers.iter().find(|container| &container.id == id))
+            .cloned()
+        else {
+            self.container_delete_confirm_open = false;
+            return;
+        };
+
+        egui::Modal::new("container_delete_confirm".into()).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(RichText::new("确认删除容器").size(20.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new("所选容器及其中未持久化的数据将被移除。").weak());
+            ui.add_space(14.0);
+
+            let warning_fill = if ui.visuals().dark_mode {
+                Color32::from_rgb(55, 32, 34)
+            } else {
+                Color32::from_rgb(255, 241, 241)
+            };
+            egui::Frame::group(ui.style())
+                .fill(warning_fill)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("!")
+                                .size(22.0)
+                                .strong()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!("即将删除容器 {}", container.names)).strong(),
+                            );
+                            let warning = if container.state.eq_ignore_ascii_case("running") {
+                                "容器正在运行，将被强制停止并删除。"
+                            } else {
+                                "删除后无法撤销。请确保容器不再需要。"
+                            };
+                            ui.label(RichText::new(warning).weak());
+                        });
+                    });
+                });
+
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.operation_running,
+                        egui::Button::new(RichText::new("确认删除").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(190, 55, 55))
+                            .min_size(egui::vec2(92.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.container_delete_confirm_open = false;
+                    self.delete_container(container.id.clone(), ctx.clone());
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add(egui::Button::new("取消").min_size(egui::vec2(72.0, 32.0)))
+                    .clicked()
+                {
+                    self.container_delete_confirm_open = false;
+                }
+            });
+        });
+    }
+
+    fn container_create_modal(&mut self, ctx: &egui::Context) {
+        if !self.container_create_open {
+            return;
+        }
+        let image_options: Vec<_> = self.images.iter().map(ImageRow::command_target).collect();
+
+        egui::Modal::new("container_create".into()).show(ctx, |ui| {
+            ui.set_width(720.0);
+            ui.heading(RichText::new("创建容器").size(20.0));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("根据 wslc run 参数配置并创建容器。多值参数每行填写一项。").weak(),
+            );
+            ui.add_space(12.0);
+
+            ui.add_enabled_ui(!self.operation_running, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("container_create_form")
+                    .max_height((ctx.content_rect().height() - 180.0).max(220.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.heading(RichText::new("基本设置").size(16.0));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("镜像名称 *").strong());
+                        ui.add_enabled_ui(!image_options.is_empty(), |ui| {
+                            egui::ComboBox::from_id_salt("container_create_image")
+                                .selected_text(if self.container_create_form.image.is_empty() {
+                                    "请选择本地镜像"
+                                } else {
+                                    &self.container_create_form.image
+                                })
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    for image in &image_options {
+                                        ui.selectable_value(
+                                            &mut self.container_create_form.image,
+                                            image.clone(),
+                                            image,
+                                        );
+                                    }
+                                });
+                        });
+                        if image_options.is_empty() {
+                            ui.label(
+                                RichText::new("暂无本地镜像，请先到镜像列表拉取镜像。")
+                                    .small()
+                                    .color(ui.visuals().error_fg_color),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        form_input(
+                            ui,
+                            "容器名称",
+                            &mut self.container_create_form.name,
+                            "--name",
+                        );
+                        form_input(
+                            ui,
+                            "启动命令",
+                            &mut self.container_create_form.command,
+                            "例如：/bin/bash",
+                        );
+                        form_multiline(
+                            ui,
+                            "命令参数",
+                            &mut self.container_create_form.arguments,
+                            "每行一个参数",
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(
+                                &mut self.container_create_form.detach,
+                                "分离模式 (--detach)",
+                            );
+                            ui.checkbox(
+                                &mut self.container_create_form.interactive,
+                                "保持 Stdin 打开 (--interactive)",
+                            );
+                            ui.checkbox(&mut self.container_create_form.tty, "打开 TTY (--tty)");
+                            ui.checkbox(
+                                &mut self.container_create_form.remove,
+                                "停止后移除 (--rm)",
+                            );
+                        });
+
+                        ui.add_space(12.0);
+                        egui::CollapsingHeader::new("网络与端口")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                form_input(
+                                    ui,
+                                    "网络",
+                                    &mut self.container_create_form.network,
+                                    "--network",
+                                );
+                                form_multiline(
+                                    ui,
+                                    "发布端口",
+                                    &mut self.container_create_form.publish,
+                                    "例如：8080:80；每行一项",
+                                );
+                                ui.checkbox(
+                                    &mut self.container_create_form.publish_all,
+                                    "将所有公开端口随机发布 (--publish-all)",
+                                );
+                                form_multiline(
+                                    ui,
+                                    "DNS 服务器",
+                                    &mut self.container_create_form.dns,
+                                    "IP 地址；每行一项",
+                                );
+                                form_multiline(
+                                    ui,
+                                    "DNS 选项",
+                                    &mut self.container_create_form.dns_option,
+                                    "每行一项",
+                                );
+                                form_multiline(
+                                    ui,
+                                    "DNS 搜索域",
+                                    &mut self.container_create_form.dns_search,
+                                    "每行一项",
+                                );
+                                form_multiline(
+                                    ui,
+                                    "网络别名",
+                                    &mut self.container_create_form.network_alias,
+                                    "每行一项",
+                                );
+                                form_input(
+                                    ui,
+                                    "主机名",
+                                    &mut self.container_create_form.hostname,
+                                    "--hostname",
+                                );
+                                form_input(
+                                    ui,
+                                    "域名",
+                                    &mut self.container_create_form.domainname,
+                                    "--domainname",
+                                );
+                            });
+
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("环境与元数据").show(ui, |ui| {
+                            form_multiline(
+                                ui,
+                                "环境变量",
+                                &mut self.container_create_form.env,
+                                "Key=Value；每行一项",
+                            );
+                            form_multiline(
+                                ui,
+                                "环境变量文件",
+                                &mut self.container_create_form.env_file,
+                                "文件路径；每行一项",
+                            );
+                            form_multiline(
+                                ui,
+                                "标签",
+                                &mut self.container_create_form.label,
+                                "Key=Value；每行一项",
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("资源限制").show(ui, |ui| {
+                            form_input(
+                                ui,
+                                "CPU 数",
+                                &mut self.container_create_form.cpus,
+                                "例如：0.5、1、2.5",
+                            );
+                            form_input(
+                                ui,
+                                "内存限制",
+                                &mut self.container_create_form.memory,
+                                "例如：512M、1G",
+                            );
+                            form_input(
+                                ui,
+                                "共享内存大小",
+                                &mut self.container_create_form.shm_size,
+                                "例如：64M、1G",
+                            );
+                            form_input(
+                                ui,
+                                "GPU",
+                                &mut self.container_create_form.gpus,
+                                "例如：all",
+                            );
+                            form_multiline(
+                                ui,
+                                "Ulimit",
+                                &mut self.container_create_form.ulimit,
+                                "name=soft[:hard]；每行一项",
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("存储与工作目录").show(ui, |ui| {
+                            form_multiline(
+                                ui,
+                                "卷挂载",
+                                &mut self.container_create_form.volume,
+                                "例如：主机路径:容器路径；每行一项",
+                            );
+                            form_multiline(
+                                ui,
+                                "tmpfs 挂载",
+                                &mut self.container_create_form.tmpfs,
+                                "容器路径；每行一项",
+                            );
+                            form_input(
+                                ui,
+                                "工作目录",
+                                &mut self.container_create_form.workdir,
+                                "容器内路径",
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("高级设置").show(ui, |ui| {
+                            form_input(
+                                ui,
+                                "入口点",
+                                &mut self.container_create_form.entrypoint,
+                                "--entrypoint",
+                            );
+                            form_input(
+                                ui,
+                                "运行用户",
+                                &mut self.container_create_form.user,
+                                "name、uid 或 uid:gid",
+                            );
+                            form_input(
+                                ui,
+                                "停止信号",
+                                &mut self.container_create_form.stop_signal,
+                                "例如：SIGTERM",
+                            );
+                            form_input(
+                                ui,
+                                "容器 ID 文件",
+                                &mut self.container_create_form.cidfile,
+                                "写入容器 ID 的文件路径",
+                            );
+                        });
+                    });
+            });
+
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button_text = if self.operation_running {
+                    "创建中..."
+                } else {
+                    "创建容器"
+                };
+                if ui
+                    .add_enabled(
+                        !self.operation_running
+                            && !self.container_create_form.image.trim().is_empty(),
+                        egui::Button::new(RichText::new(button_text).color(Color32::WHITE))
+                            .fill(Color32::from_rgb(50, 105, 190))
+                            .min_size(egui::vec2(96.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.create_container(ctx.clone());
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(
+                        !self.operation_running,
+                        egui::Button::new("取消").min_size(egui::vec2(72.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.container_create_open = false;
+                }
+                if self.operation_running {
+                    ui.spinner();
+                }
+            });
+        });
     }
 
     fn container_page(&mut self, ui: &mut egui::Ui) {
@@ -778,22 +1678,110 @@ impl DevDock {
             }
         });
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.container_name_query)
-                    .hint_text("容器名称")
-                    .desired_width(190.0),
-            );
-            ui.add_space(10.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.container_image_query)
-                    .hint_text("镜像名称")
-                    .desired_width(190.0),
-            );
-            if self.operation_running {
-                ui.spinner();
-            }
-        });
+        let selected_container = self
+            .selected_container
+            .as_ref()
+            .and_then(|id| self.containers.iter().find(|container| &container.id == id))
+            .cloned();
+        egui::Frame::group(ui.style())
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let search_width = ((ui.available_width() - 300.0) / 2.0).clamp(145.0, 190.0);
+                    ui.add_sized(
+                        [search_width, 34.0],
+                        egui::TextEdit::singleline(&mut self.container_name_query)
+                            .hint_text("容器名称")
+                            .font(egui::FontId::proportional(14.0))
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_sized(
+                        [search_width, 34.0],
+                        egui::TextEdit::singleline(&mut self.container_image_query)
+                            .hint_text("镜像名称")
+                            .font(egui::FontId::proportional(14.0))
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.separator();
+
+                    if ui
+                        .add_enabled(
+                            !self.operation_running,
+                            egui::Button::new(RichText::new("创建").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(50, 105, 190))
+                                .min_size(egui::vec2(76.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.container_create_form = CreateContainerForm {
+                            image: self
+                                .images
+                                .first()
+                                .map(ImageRow::command_target)
+                                .unwrap_or_default(),
+                            ..Default::default()
+                        };
+                        self.container_create_open = true;
+                    }
+
+                    let can_operate = selected_container.is_some() && !self.operation_running;
+                    let delete_color = ui.visuals().error_fg_color;
+                    if ui
+                        .add_enabled(
+                            can_operate,
+                            egui::Button::new(RichText::new("删除").color(delete_color))
+                                .stroke(egui::Stroke::new(1.0, delete_color))
+                                .min_size(egui::vec2(76.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.container_delete_confirm_open = true;
+                    }
+
+                    let running = selected_container
+                        .as_ref()
+                        .is_some_and(|container| container.state.eq_ignore_ascii_case("running"));
+                    if ui
+                        .add_enabled(
+                            can_operate && running,
+                            egui::Button::new(RichText::new("Shell").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(50, 105, 190))
+                                .min_size(egui::vec2(76.0, 34.0)),
+                        )
+                        .clicked()
+                        && let Some(container) = &selected_container
+                    {
+                        self.open_container_shell(container.clone(), ui.ctx().clone());
+                    }
+                    if ui
+                        .add_enabled(
+                            can_operate,
+                            egui::Button::new(
+                                RichText::new(if running { "停止" } else { "启动" })
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(if running {
+                                Color32::from_rgb(180, 110, 45)
+                            } else {
+                                Color32::from_rgb(50, 105, 190)
+                            })
+                            .min_size(egui::vec2(76.0, 34.0)),
+                        )
+                        .clicked()
+                        && let Some(container) = &selected_container
+                    {
+                        if running {
+                            self.stop_container(container.id.clone(), ui.ctx().clone());
+                        } else {
+                            self.start_container(container.id.clone(), ui.ctx().clone());
+                        }
+                    }
+                    if self.operation_running {
+                        ui.spinner();
+                    }
+                });
+            });
         ui.add_space(12.0);
 
         let name_query = self.container_name_query.trim().to_lowercase();
@@ -809,112 +1797,195 @@ impl DevDock {
             .collect();
 
         style_table_rows(ui);
-        egui::ScrollArea::horizontal()
-            .id_salt("containers_horizontal_scroll")
-            .auto_shrink([false, false])
+        if containers.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(120.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    let message = if self.containers_loading {
+                        "正在加载容器..."
+                    } else if self.containers.is_empty() {
+                        "暂无容器"
+                    } else {
+                        "没有符合筛选条件的容器"
+                    };
+                    ui.label(RichText::new(message).size(15.0).weak());
+                    if !self.containers_loading && self.containers.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("点击上方“创建”运行新容器").small().weak());
+                    }
+                });
+            });
+            return;
+        }
+
+        egui::Frame::group(ui.style())
+            .inner_margin(0.0)
             .show(ui, |ui| {
-                ui.set_min_width(1_250.0);
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::exact(125.0))
-                    .column(Column::initial(180.0).at_least(140.0))
-                    .column(Column::initial(150.0).at_least(100.0))
-                    .column(Column::initial(340.0).at_least(160.0))
-                    .column(Column::remainder().at_least(450.0))
-                    .header(32.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("操作");
-                        });
-                        header.col(|ui| {
-                            ui.strong("容器名称");
-                        });
-                        header.col(|ui| {
-                            ui.strong("状态");
-                        });
-                        header.col(|ui| {
-                            ui.strong("镜像名称");
-                        });
-                        header.col(|ui| {
-                            ui.strong("容器 ID");
-                        });
-                    })
-                    .body(|mut body| {
-                        for container in containers {
-                            body.row(30.0, |mut row| {
-                                row.set_selected(
-                                    self.selected_container.as_ref() == Some(&container.id),
-                                );
-                                row.col(|ui| {
-                                    ui.horizontal(|ui| {
-                                        let running =
-                                            container.state.eq_ignore_ascii_case("running");
-                                        if ui
-                                            .add_enabled(
-                                                !self.operation_running,
-                                                egui::Button::new(if running {
-                                                    "停止"
-                                                } else {
-                                                    "启动"
-                                                }),
+                egui::ScrollArea::horizontal()
+                    .id_salt("containers_horizontal_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(1_100.0);
+                        let header_color = ui.visuals().weak_text_color();
+                        let shell_ctx = ui.ctx().clone();
+                        TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(true)
+                            .sense(egui::Sense::click())
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::initial(220.0).at_least(150.0))
+                            .column(Column::initial(180.0).at_least(130.0))
+                            .column(Column::initial(300.0).at_least(180.0))
+                            .column(Column::initial(260.0).at_least(160.0))
+                            .column(Column::remainder().at_least(300.0))
+                            .header(38.0, |mut header| {
+                                for title in ["容器名称", "状态", "镜像名称", "端口", "容器 ID"]
+                                {
+                                    header.col(|ui| {
+                                        ui.label(RichText::new(title).strong().color(header_color));
+                                    });
+                                }
+                            })
+                            .body(|mut body| {
+                                for container in containers {
+                                    body.row(40.0, |mut row| {
+                                        row.set_selected(
+                                            self.selected_container.as_ref() == Some(&container.id),
+                                        );
+                                        row.col(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&container.names).strong(),
+                                                )
+                                                .truncate(),
                                             )
-                                            .clicked()
-                                        {
-                                            if running {
-                                                self.stop_container(
-                                                    container.id.clone(),
-                                                    ui.ctx().clone(),
-                                                );
+                                            .on_hover_text(&container.names);
+                                        });
+                                        row.col(|ui| {
+                                            let running =
+                                                container.state.eq_ignore_ascii_case("running");
+                                            let color = if running {
+                                                Color32::from_rgb(43, 166, 102)
                                             } else {
-                                                self.start_container(
-                                                    container.id.clone(),
-                                                    ui.ctx().clone(),
-                                                );
-                                            }
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                !self.operation_running,
-                                                egui::Button::new("删除"),
+                                                ui.visuals().weak_text_color()
+                                            };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&container.status).color(color),
+                                                )
+                                                .truncate(),
                                             )
-                                            .clicked()
-                                        {
-                                            self.delete_container(
-                                                container.id.clone(),
-                                                ui.ctx().clone(),
+                                            .on_hover_text(&container.status);
+                                        });
+                                        row.col(|ui| {
+                                            ui.add(egui::Label::new(&container.image).truncate())
+                                                .on_hover_text(&container.image);
+                                        });
+                                        row.col(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&container.ports).monospace(),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&container.ports);
+                                        });
+                                        row.col(|ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&container.id).monospace().weak(),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&container.id);
+                                        });
+                                        let response = row.response();
+                                        if response.clicked() || response.secondary_clicked() {
+                                            self.selected_container = Some(container.id.clone());
+                                        }
+                                        if container_context_menu(&response, &container) {
+                                            self.open_container_shell(
+                                                container.clone(),
+                                                shell_ctx.clone(),
                                             );
                                         }
                                     });
-                                });
-                                row.col(|ui| {
-                                    ui.label(&container.names);
-                                });
-                                row.col(|ui| {
-                                    let running = container.state.eq_ignore_ascii_case("running");
-                                    let color = if running {
-                                        Color32::from_rgb(43, 166, 102)
-                                    } else {
-                                        ui.visuals().weak_text_color()
-                                    };
-                                    ui.label(RichText::new(&container.status).color(color));
-                                });
-                                row.col(|ui| {
-                                    ui.label(&container.image);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&container.id);
-                                });
-                                let response = row.response();
-                                if response.clicked() || response.secondary_clicked() {
-                                    self.selected_container = Some(container.id.clone());
                                 }
-                                container_context_menu(&response, &container);
                             });
-                        }
                     });
             });
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("设置");
+        ui.add_space(12.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("暂无可配置项").weak());
+            });
+    }
+
+    fn open_container_shell(&mut self, container: ContainerRow, ctx: egui::Context) {
+        if !container.state.eq_ignore_ascii_case("running") {
+            self.status = Some(("只有运行中的容器可以进入 Shell".to_owned(), true));
+            return;
+        }
+
+        self.terminal = None;
+        match TerminalSession::start(
+            &wslc_executable(),
+            &container.id,
+            container.names.clone(),
+            ctx,
+        ) {
+            Ok(terminal) => {
+                self.terminal = Some(terminal);
+                self.page = Page::Shell;
+                self.status = Some((format!("已进入容器 {} 的 Shell", container.names), false));
+            }
+            Err(error) => self.status = Some((error, true)),
+        }
+    }
+
+    fn shell_page(&mut self, ui: &mut egui::Ui) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            self.page = Page::Containers;
+            return;
+        };
+
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.heading(format!("容器 Shell · {}", terminal.container_name));
+            ui.add_space(8.0);
+            if terminal.is_running() {
+                ui.spinner();
+                ui.label(RichText::new("已连接").color(Color32::from_rgb(43, 166, 102)));
+            } else if let Some(message) = terminal.exit_message() {
+                ui.label(RichText::new(message).color(ui.visuals().weak_text_color()));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("关闭 Shell").clicked() {
+                    close = true;
+                }
+                ui.label(
+                    RichText::new("拖动选择，Ctrl+Shift+C 复制，Ctrl+V 粘贴")
+                        .small()
+                        .weak(),
+                );
+            });
+        });
+        ui.add_space(10.0);
+        terminal.show(ui);
+
+        if close {
+            self.terminal = None;
+            self.page = Page::Containers;
+            self.status = Some(("Shell 已关闭".to_owned(), false));
+        }
     }
 }
 
@@ -923,7 +1994,7 @@ impl ImageRow {
         format!("{}\0{}\0{}", self.repository, self.tag, self.id)
     }
 
-    fn delete_target(&self) -> String {
+    fn command_target(&self) -> String {
         if self.repository == "<none>" || self.tag == "<none>" {
             self.id.clone()
         } else {
@@ -959,8 +2030,36 @@ impl From<WslcContainer> for ContainerRow {
             image: container.image,
             status: format!("{} {}", state, relative_time(container.state_changed_at)),
             state: state.to_owned(),
+            ports: format_ports(&container.ports),
         }
     }
+}
+
+fn format_ports(ports: &[WslcPort]) -> String {
+    if ports.is_empty() {
+        return "-".to_owned();
+    }
+
+    ports
+        .iter()
+        .map(|port| {
+            let protocol = match port.protocol {
+                6 => "tcp".to_owned(),
+                17 => "udp".to_owned(),
+                value => value.to_string(),
+            };
+            let address = if port.binding_address.contains(':') {
+                format!("[{}]", port.binding_address)
+            } else {
+                port.binding_address.clone()
+            };
+            format!(
+                "{address}:{} -> {}/{}",
+                port.host_port, port.container_port, protocol
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl eframe::App for DevDock {
@@ -986,11 +2085,35 @@ impl eframe::App for DevDock {
             match self.page {
                 Page::Images => self.image_page(ui),
                 Page::Containers => self.container_page(ui),
+                Page::Shell => self.shell_page(ui),
+                Page::Settings => self.settings_page(ui),
             }
         });
+        self.image_delete_confirm_modal(ui.ctx());
+        self.container_delete_confirm_modal(ui.ctx());
+        self.container_create_modal(ui.ctx());
+        self.image_pull_modal(ui.ctx());
         self.update_modal(ui.ctx());
         self.wslc_install_modal(ui.ctx());
     }
+}
+
+fn form_input(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(RichText::new(label).strong());
+    ui.add_sized(
+        [ui.available_width(), 32.0],
+        egui::TextEdit::singleline(value).hint_text(hint),
+    );
+    ui.add_space(6.0);
+}
+
+fn form_multiline(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(RichText::new(label).strong());
+    ui.add_sized(
+        [ui.available_width(), 58.0],
+        egui::TextEdit::multiline(value).hint_text(hint),
+    );
+    ui.add_space(6.0);
 }
 
 fn style_table_rows(ui: &mut egui::Ui) {
@@ -1027,8 +2150,20 @@ fn image_context_menu(response: &egui::Response, image: &ImageRow) {
     });
 }
 
-fn container_context_menu(response: &egui::Response, container: &ContainerRow) {
+fn container_context_menu(response: &egui::Response, container: &ContainerRow) -> bool {
+    let mut open_shell = false;
     response.context_menu(|ui| {
+        if ui
+            .add_enabled(
+                container.state.eq_ignore_ascii_case("running"),
+                egui::Button::new("进入 Shell"),
+            )
+            .clicked()
+        {
+            open_shell = true;
+            ui.close();
+        }
+        ui.separator();
         if ui.button("复制容器名称").clicked() {
             ui.ctx().copy_text(container.names.clone());
             ui.close();
@@ -1038,6 +2173,7 @@ fn container_context_menu(response: &egui::Response, container: &ContainerRow) {
             ui.close();
         }
     });
+    open_shell
 }
 
 fn check_for_update() -> Result<Option<UpdateInfo>, String> {
@@ -1231,6 +2367,14 @@ fn wslc_json<T: for<'de> Deserialize<'de>>(args: &[&str]) -> Result<Vec<T>, Stri
 }
 
 fn run_wslc(args: &[&str]) -> Result<String, String> {
+    run_wslc_args(args)
+}
+
+fn run_wslc_args<I, S>(args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let output = Command::new(wslc_executable())
         .args(args)
         .output()
@@ -1248,6 +2392,62 @@ fn run_wslc(args: &[&str]) -> Result<String, String> {
     }
 }
 
+fn run_wslc_pull(image: &str, tx: Sender<Message>, ctx: egui::Context) -> Result<(), String> {
+    let mut child = Command::new(wslc_executable())
+        .args(["pull", image])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法运行 wslc，请确认 WSLC 已安装：{error}"))?;
+
+    let stdout = child.stdout.take().expect("piped stdout is available");
+    let stderr = child.stderr.take().expect("piped stderr is available");
+    let stdout_tx = tx.clone();
+    let stdout_ctx = ctx.clone();
+    let stdout_thread = thread::spawn(move || {
+        forward_pull_output(stdout, stdout_tx, stdout_ctx);
+    });
+    let stderr_thread = thread::spawn(move || {
+        forward_pull_output(stderr, tx, ctx);
+    });
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("等待 WSLC 拉取命令时出错：{error}"))?;
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("镜像拉取失败（{status}）"))
+    }
+}
+
+fn forward_pull_output(reader: impl Read, tx: Sender<Message>, ctx: egui::Context) {
+    let mut reader = BufReader::new(reader);
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {
+                let output = decode_command_output(&buffer);
+                if !output.is_empty() {
+                    let _ = tx.send(Message::ImagePullOutput(output));
+                    ctx.request_repaint();
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(Message::ImagePullOutput(format!(
+                    "\n读取命令输出失败：{error}\n"
+                )));
+                ctx.request_repaint();
+                break;
+            }
+        }
+    }
+}
+
 fn wslc_executable() -> std::path::PathBuf {
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
         let path = std::path::PathBuf::from(program_files)
@@ -1261,10 +2461,24 @@ fn wslc_executable() -> std::path::PathBuf {
 }
 
 fn is_wslc_available() -> bool {
+    get_wslc_version().is_some()
+}
+
+fn get_wslc_version() -> Option<String> {
     Command::new(wslc_executable())
         .arg("--version")
         .output()
-        .is_ok_and(|output| output.status.success())
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let version = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .strip_prefix("wslc ")
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            (!version.is_empty()).then_some(version)
+        })
 }
 
 fn install_wslc() -> Result<String, String> {
@@ -1451,6 +2665,95 @@ mod tests {
             hash.to_ascii_lowercase()
         );
         assert!(parse_expected_checksum("invalid").is_err());
+    }
+
+    #[test]
+    fn parses_and_formats_container_ports() {
+        let container: WslcContainer = serde_json::from_str(
+            r#"{
+                "Id": "container-id",
+                "Name": "web",
+                "Image": "example/web:latest",
+                "State": 2,
+                "StateChangedAt": 0,
+                "Ports": [
+                    {
+                        "BindingAddress": "127.0.0.1",
+                        "ContainerPort": 3000,
+                        "HostPort": 8080,
+                        "Protocol": 6
+                    },
+                    {
+                        "BindingAddress": "::1",
+                        "ContainerPort": 53,
+                        "HostPort": 53,
+                        "Protocol": 17
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let row = ContainerRow::from(container);
+        assert_eq!(row.ports, "127.0.0.1:8080 -> 3000/tcp, [::1]:53 -> 53/udp");
+    }
+
+    #[test]
+    fn builds_container_run_arguments() {
+        let form = CreateContainerForm {
+            image: " example/web:latest ".to_owned(),
+            command: "/bin/sh".to_owned(),
+            arguments: "-c\necho hello\n".to_owned(),
+            cpus: "0.5".to_owned(),
+            detach: true,
+            env: "MODE=prod\nDEBUG=false".to_owned(),
+            publish: "8080:80\n8443:443".to_owned(),
+            remove: true,
+            name: "web".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            form.to_args().unwrap(),
+            [
+                "run",
+                "--cpus",
+                "0.5",
+                "--detach",
+                "--env",
+                "MODE=prod",
+                "--env",
+                "DEBUG=false",
+                "--name",
+                "web",
+                "--publish",
+                "8080:80",
+                "--publish",
+                "8443:443",
+                "--rm",
+                "example/web:latest",
+                "/bin/sh",
+                "-c",
+                "echo hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn validates_container_run_arguments() {
+        assert!(CreateContainerForm::default().to_args().is_err());
+        let invalid_cpus = CreateContainerForm {
+            image: "ubuntu".to_owned(),
+            cpus: "zero".to_owned(),
+            ..Default::default()
+        };
+        assert!(invalid_cpus.to_args().is_err());
+        let non_finite_cpus = CreateContainerForm {
+            image: "ubuntu".to_owned(),
+            cpus: "NaN".to_owned(),
+            ..Default::default()
+        };
+        assert!(non_finite_cpus.to_args().is_err());
     }
 
     #[test]
